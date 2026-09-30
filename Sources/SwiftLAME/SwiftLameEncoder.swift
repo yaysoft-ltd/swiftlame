@@ -1,0 +1,146 @@
+
+import AVFAudio
+import LAME
+
+
+public struct SwiftLameEncoder: Sendable {
+    
+    // MARK: Private
+    
+    private let configuration: LameConfiguration
+    private let destinationUrl: URL
+    private let frameCount: AVAudioFrameCount = 1024 * 8
+    private let progress: Progress
+    private let sourceUrl: URL
+    
+    // MARK: Lifecycle
+    
+    public init(sourceUrl: URL, configuration: LameConfiguration, destinationUrl: URL, progress: Progress = Progress()) throws {
+        _ = try AVAudioFile(forReading: sourceUrl)
+        self.sourceUrl = sourceUrl
+        self.configuration = configuration
+        self.destinationUrl = destinationUrl
+        self.progress = progress
+    }
+    
+    // MARK: Encoding
+    
+    public func encode(priority: TaskPriority = .medium) async throws {
+        try await Task(priority: priority) { [self] in
+            try _encode()
+        }.value
+    }
+    
+    private func _encode() throws {
+        let sourceAudioFile = try AVAudioFile(forReading: sourceUrl)
+        let audioFormat = sourceAudioFile.processingFormat
+        
+        guard let sourceAudioBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount) else {
+            throw SwiftLameError.couldNotCreateAudioPCMBuffer
+        }
+        guard let outputStream = OutputStream(url: destinationUrl, append: true) else {
+            throw SwiftLameError.couldNotCreateOutputStreamTo(url: destinationUrl)
+        }
+        
+        let lame = Lame(for: sourceAudioFile, configuration: configuration)
+        let mBytesPerFrame = sourceAudioFile.processingFormat.streamDescription.pointee.mBytesPerFrame
+        let bufferCapacity = Int(frameCount * mBytesPerFrame)
+        var tmpEncodingBuffer = Data(count: bufferCapacity)
+        
+        progress.totalUnitCount = Int64(sourceAudioFile.length)
+        
+        outputStream.open()
+        var position: AVAudioFramePosition = 0
+        
+        while position < sourceAudioFile.length {
+            if progress.isCancelled {
+                break
+            }
+            
+            try sourceAudioFile.read(into: sourceAudioBuffer)
+            // A read that returns no frames before `length` (a header that
+            // overstates the file) would otherwise spin here forever.
+            if sourceAudioBuffer.frameLength == 0 { break }
+            
+            position += AVAudioFramePosition(sourceAudioBuffer.frameLength)
+            let isLastFrame = position == sourceAudioFile.length
+            
+            try encodeFrame(with: lame, from: sourceAudioBuffer, to: outputStream, using: &tmpEncodingBuffer, isLastFrame: isLastFrame)
+            
+            progress.completedUnitCount = Int64(position)
+        }
+        
+        outputStream.close()
+        
+        if progress.isCancelled {
+            try? FileManager.default.removeItem(at: destinationUrl)
+        }
+    }
+    
+    private func encodeFrame(
+        with lame: Lame,
+        from sourceAudioBuffer: AVAudioPCMBuffer,
+        to outputStream: OutputStream,
+        using tmpEncodingBuffer: inout Data,
+        isLastFrame: Bool
+    ) throws {
+        let sourceChannelData = try sourceAudioBuffer.getChannelData()
+        let frameCount = sourceAudioBuffer.frameLength
+        let bufferCapacity = tmpEncodingBuffer.count
+        
+        try tmpEncodingBuffer.withUnsafeMutableBytes { (bufferPointer: UnsafeMutableRawBufferPointer) in
+            let memoryBoundBuffer = bufferPointer.bindMemory(to: UInt8.self)
+            guard let bufferAddress = memoryBoundBuffer.baseAddress else {
+                throw SwiftLameError.couldNotGetRawOutputBufferPointerBaseAddress
+            }
+            
+            let encodeLength = encodeChannelData(
+                sourceChannelData,
+                with: lame,
+                frameCount: frameCount,
+                usingBufferAt: bufferAddress,
+                capacity: bufferCapacity
+            )
+            
+            try write(bufferAddress, length: encodeLength, to: outputStream)
+            
+            if isLastFrame {
+                let finalEncodeLength = lame.finalizeEncoding(
+                    usingBufferAt: bufferAddress,
+                    with: bufferCapacity
+                )
+                try write(bufferAddress, length: finalEncodeLength, to: outputStream)
+            }
+        }
+    }
+    
+    /// Every byte LAME produced must land in the file: a negative length is a
+    /// LAME error and a short write is a full disk. Either one used to pass
+    /// silently and leave a truncated MP3 marked as done.
+    private func write(_ bytes: UnsafeMutablePointer<UInt8>, length: Int, to stream: OutputStream) throws {
+        guard length >= 0 else { throw SwiftLameError.couldNotWriteOutput(url: destinationUrl) }
+        var written = 0
+        while written < length {
+            let n = stream.write(bytes + written, maxLength: length - written)
+            guard n > 0 else { throw SwiftLameError.couldNotWriteOutput(url: destinationUrl) }
+            written += n
+        }
+    }
+    
+    private func encodeChannelData(
+        _ channelData: AVAudioChannelData,
+        with lame: Lame,
+        frameCount: AVAudioFrameCount,
+        usingBufferAt bufferAddress: UnsafeMutablePointer<UInt8>,
+        capacity: Int
+    ) -> Int {
+        switch channelData {
+        case .float(let data):
+            return lame.encodeIEEEFloatData(data, frameCount: frameCount, fillingBufferAt: bufferAddress, with: capacity)
+        case .int16(let data):
+            return lame.encodeInt16Data(data, frameCount: frameCount, fillingBufferAt: bufferAddress, with: capacity)
+        case .int32(let data):
+            return lame.encodeInt32Data(data, frameCount: frameCount, fillingBufferAt: bufferAddress, with: capacity)
+        }
+    }
+}
